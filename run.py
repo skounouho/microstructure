@@ -11,11 +11,12 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, GridSearchCV
 from torch.utils.data import DataLoader, Subset
 from sklearn.svm import SVC
 from sklearn.decomposition import PCA
 from sklearn.tree import DecisionTreeClassifier
+from sklearn.metrics import f1_score, accuracy_score, confusion_matrix, classification_report
 import joblib
 
 from src.utils import load_vti, get_xy_slice
@@ -27,6 +28,7 @@ LOGS_DIR = Path(__file__).parent / "logs"
 MODELS_DIR = Path(__file__).parent / "models"
 
 RANDOM_SEED = 42
+NUM_CV_FOLDS = 5
 
 # Available VTI files
 VTI_FILES = {
@@ -446,18 +448,35 @@ def train_svc(args):
 
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
     
-    # Fit using support-vector machine classification with scikit
-    clf = SVC(C=1, kernel='linear')
+    param_grid = [
+        {'kernel': ['linear'], 'C': [0.1, 1, 10]},
+        {'kernel': ['rbf'], 'C': [0.1, 1, 10], 'gamma': ['scale', 0.1, 0.01]}
+    ]
+    
+    print(f"Performing GridSearchCV with {NUM_CV_FOLDS}-fold cross-validation...")
+    clf = GridSearchCV(
+        estimator=SVC(random_state=42),
+        param_grid=param_grid,
+        cv=NUM_CV_FOLDS,
+        scoring='f1_weighted',
+        n_jobs=-1,
+        verbose=2
+    )
+    
     clf.fit(X_train, y_train)
+    
+    print(f"\nBest parameters: {clf.best_params_}")
+    print(f"Best cross-validation score: {clf.best_score_:.4f}")
+    
     train_acc = clf.score(X_train, y_train)
     val_acc = clf.score(X_test, y_test)
 
     print(f"Train Acc: {train_acc:.2%} | "
           f"Val Acc: {val_acc:.2%}")
 
-    # Save the model
-    joblib.dump(clf, MODELS_DIR / "svc.pkl")
-    print(f"Saved model to {MODELS_DIR / 'svc.pkl'}")
+    # Save the model (saves the best estimator)
+    joblib.dump(clf.best_estimator_, MODELS_DIR / "svc.pkl")
+    print(f"Saved best model to {MODELS_DIR / 'svc.pkl'}")
 
     return 0
 
@@ -474,35 +493,96 @@ def test(args):
 
 def test_cnn(args):
     """Test a CNN model on the dataset."""
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+    
     model = MicrostructureCNN(num_classes=6)
-    model.load_state_dict(torch.load(MODELS_DIR / "cnn.pth"))
+    checkpoint = torch.load(MODELS_DIR / "cnn.pth", map_location=device)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    model = model.to(device)
     model.eval()
 
+    print(f"Loading test data from {args.datafile}...")
     datafile = args.datafile
     data = np.load(DATA_DIR / datafile)
     X = data["X"].reshape(-1, 64, 64)
     y = data["y"].squeeze()
+    print(f"Test data shape: X={X.shape}, y={y.shape}")
 
+    # Create dataset and dataloader for batch processing
+    test_dataset = MicrostructureDataset(X, y)
+    test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
+    
+    all_predictions = []
+    all_labels = []
+    
     with torch.no_grad():
-        outputs = model(X)
-    _, predicted = torch.max(outputs.data, 1)
-    test_acc = (predicted == y).sum().item() / len(y)
-    print(f"Acc: {test_acc:.2%}")
+        for inputs, labels in test_loader:
+            inputs = inputs.to(device)
+            outputs = model(inputs)
+            _, predicted = torch.max(outputs.data, 1)
+            all_predictions.extend(predicted.cpu().numpy())
+            all_labels.extend(labels.numpy())
+    
+    all_predictions = np.array(all_predictions)
+    all_labels = np.array(all_labels)
+    
+    # Calculate metrics
+    accuracy = accuracy_score(all_labels, all_predictions)
+    f1_weighted = f1_score(all_labels, all_predictions, average='weighted')
+    f1_macro = f1_score(all_labels, all_predictions, average='macro')
+    cm = confusion_matrix(all_labels, all_predictions)
+    
+    # Print results
+    print("\n" + "=" * 70)
+    print("TEST RESULTS")
+    print("=" * 70)
+    print(f"Accuracy:        {accuracy:.2%}")
+    print(f"F1 Score (weighted): {f1_weighted:.4f}")
+    print(f"F1 Score (macro):    {f1_macro:.4f}")
+    print("\nConfusion Matrix:")
+    print(cm)
+    print("\nClassification Report:")
+    print(classification_report(all_labels, all_predictions, 
+                                target_names=[f"Class {i}" for i in range(6)]))
+    print("=" * 70)
     
     return 0
 
 def test_svc(args):
     """Test a SVC model on the dataset."""
+    print("Loading SVC model...")
     model = joblib.load(MODELS_DIR / "svc.pkl")
 
+    print(f"Loading test data from {args.datafile}...")
     datafile = args.datafile
     data = np.load(DATA_DIR / datafile)
     X = data["X"]
     y = data["y"].squeeze()
+    print(f"Test data shape: X={X.shape}, y={y.shape}")
 
+    print("Making predictions...")
     predicted = model.predict(X)
-    test_acc = (predicted == y).sum().item() / len(y)
-    print(f"Acc: {test_acc:.2%}")
+    
+    # Calculate metrics
+    accuracy = accuracy_score(y, predicted)
+    f1_weighted = f1_score(y, predicted, average='weighted')
+    f1_macro = f1_score(y, predicted, average='macro')
+    cm = confusion_matrix(y, predicted)
+    
+    # Print results
+    print("\n" + "=" * 70)
+    print("TEST RESULTS")
+    print("=" * 70)
+    print(f"Accuracy:            {accuracy:.2%}")
+    print(f"F1 Score (weighted): {f1_weighted:.4f}")
+    print(f"F1 Score (macro):    {f1_macro:.4f}")
+    print("\nConfusion Matrix:")
+    print(cm)
+    print("\nClassification Report:")
+    print(classification_report(y, predicted, 
+                                target_names=[f"Class {i}" for i in range(6)]))
+    print("=" * 70)
 
     return 0
 

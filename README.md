@@ -30,7 +30,7 @@ python run.py train --type cnn
 
 Training the CNN on the dataset achieved a training accuracy of 99.6% and a validation accuracy of 99.1%. Using a SVC on the dataset achieved a training accuracy of 99.82% and a validation accuracy of 99.12%.
 
-# Next Steps
+# Testing with Defects
 
 I am interested in the impact of defects, in the form of circular occulsions, which may represent defects in the microstructure. It would be interesting to see, for a set range of defects, how increasing the fraction of defected images in the training data might lead to better/worse accuracy in validation.
 
@@ -39,3 +39,15 @@ To generate the defect datasets, I ran the following command
 python run.py data --defect {num_defects}
 ```
 where 8, 16, 32, 64, 128 were chosen as the number of defects.
+
+To visualize any of the cross-sections, run
+
+```
+python run.py viz {filename}.npz -z {z_index}
+```
+
+To run a test on a dataset, run
+
+```
+python run.py test --type {cnn, svc} --datafile {filename.npz}
+```
