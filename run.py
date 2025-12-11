@@ -4,6 +4,7 @@
 import argparse
 from datetime import datetime
 from pathlib import Path
+from tkinter import Y
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -12,6 +13,10 @@ import torch.nn as nn
 import torch.optim as optim
 from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader, Subset
+from sklearn.svm import SVC
+from sklearn.decomposition import PCA
+from sklearn.tree import DecisionTreeClassifier
+import joblib
 
 from src.utils import load_vti, get_xy_slice
 from src.model import MicrostructureCNN, MicrostructureDataset, get_model_summary
@@ -19,6 +24,9 @@ from src.model import MicrostructureCNN, MicrostructureDataset, get_model_summar
 
 DATA_DIR = Path(__file__).parent / "data"
 LOGS_DIR = Path(__file__).parent / "logs"
+MODELS_DIR = Path(__file__).parent / "models"
+
+RANDOM_SEED = 42
 
 # Available VTI files
 VTI_FILES = {
@@ -51,11 +59,11 @@ def parse_args():
         aliases=['viz', 'plot'],
         help='Visualize XY slices of VTI data',
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=f"Available datasets: {', '.join(VTI_FILES.keys())}",
+        epilog=f"Available datasets: {', '.join(VTI_FILES.keys())} or npz file",
     )
     viz_parser.add_argument(
         "dataset",
-        choices=list(VTI_FILES.keys()),
+        # choices=list(VTI_FILES.keys()),
         help="Name of the dataset to visualize",
     )
     viz_parser.add_argument(
@@ -72,6 +80,12 @@ def parse_args():
         help='Create a dataset from the VTI data',
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
+    dataset_parser.add_argument(
+        "--defects",
+        type=int,
+        default=0,
+        help="Add defects to the dataset",
+    )
     dataset_parser.set_defaults(func=dataset)
 
     # Train subcommand
@@ -80,24 +94,55 @@ def parse_args():
         help='Train a machine learning model on the dataset',
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
+    train_parser.add_argument(
+        "--type",
+        choices=['cnn', 'svc'],
+        default='svc',
+        help="Type of model to train",
+    )
     train_parser.set_defaults(func=train)
+
+    test_parser = subparsers.add_parser(
+        'test',
+        help='Test a machine learning model on the dataset',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    test_parser.add_argument(
+        "--type",
+        choices=['cnn', 'svc'],
+        default='svc',
+        help="Type of model to test",
+    )
+    test_parser.add_argument(
+        "--datafile",
+        help="Data file to test the model on",
+    )
+    test_parser.set_defaults(func=test)
     
     return parser.parse_args()
 
 def visualize(args):
     """Visualize the XY slice of the VTI file."""
 
-    # Load the VTI file
-    vti_path = DATA_DIR / VTI_FILES[args.dataset]
-    print(f"Loading {vti_path}...")
-    vti_data = load_vti(str(vti_path))
+    # Load the VTI file or data.npz file
+    if args.dataset.endswith('npz'):
+        data = np.load(DATA_DIR / args.dataset)
+        X = data["X"].reshape(-1, 64, 64).transpose(1, 2, 0)  # shape: (n_samples, 64, 64)
+        gray = X
+        dims = X.shape
+        categories = data["y"].squeeze()
+        # spacing = (1.0, 1.0, 1.0)
+    else:
+        vti_path = DATA_DIR / VTI_FILES[args.dataset]
+        print(f"Loading {vti_path}...")
+        vti_data = load_vti(str(vti_path))
     
-    gray = vti_data['gray']
-    dims = vti_data['dimensions']
-    spacing = vti_data['spacing']
+        gray = vti_data['gray']
+        dims = vti_data['dimensions']
+        # spacing = vti_data['spacing']
     
     print(f"Data dimensions: {dims[0]} x {dims[1]} x {dims[2]}")
-    print(f"Voxel spacing: {spacing}")
+    # print(f"Voxel spacing: {spacing}")
     
     # Determine Z slice index
     z_index = args.z_index if args.z_index is not None else dims[2] // 2
@@ -117,7 +162,7 @@ def visualize(args):
     # Display the RGB slice with origin at lower-left
     # Transpose to get correct orientation (X horizontal, Y vertical)
     # Need to swap axes 0 and 1 while keeping RGB channel last
-    slice_display = np.transpose(slice_gray, (1, 0, 2))
+    slice_display = np.transpose(slice_gray, (1, 0))
 
     print(slice_display.min(), slice_display.max())
     
@@ -133,7 +178,8 @@ def visualize(args):
     # Labels and title
     ax.set_xlabel('X (voxels)')
     ax.set_ylabel('Y (voxels)')
-    ax.set_title(f'{args.dataset} — XY Slice at Z={z_index} (Gray scale)')
+    ax.set_title(f'{args.dataset} — XY Slice at Z={z_index} (Gray scale), Categories: {categories[z_index]}')
+    ax.axis('off')
     
     plt.tight_layout()
     plt.show()
@@ -142,6 +188,10 @@ def visualize(args):
 
 def dataset(args):
     """Train a machine learning model on the VTI data."""
+
+    if args.defects > 0:
+        defect_dataset(args)
+        return 0
 
     data = {}
 
@@ -163,8 +213,10 @@ def dataset(args):
     X = []
     y = []
     for i, key in enumerate(data.keys()):
-        X.append(data[key][:64, :64, :]) # shape: (n_x, n_y, n_z, 1)
-        y.append(np.repeat(i, data[key].shape[2])) # shape: (n_z,)
+        raw_data = data[key]
+        downsampled_data = raw_data[::raw_data.shape[0]//65, ::raw_data.shape[1]//65, :]
+        X.append(downsampled_data[:64, :64, :]) # shape: (n_x, n_y, n_z, 1)
+        y.append(np.repeat(i, downsampled_data.shape[2])) # shape: (n_z,)
     
     X = np.concatenate(X, axis=2).transpose(2, 3, 0, 1) # shape: (n_samples, n_x, n_y, 1)
     y = np.concatenate(y, axis=0) # shape: (n_samples,)
@@ -185,7 +237,50 @@ def dataset(args):
 
     return 0
 
+def defect_dataset(args):
+    """Create a dataset with defects."""
+    
+    data = np.load(DATA_DIR / "data.npz")
+
+    X = data["X"].reshape(-1, 64, 64)
+    y = data["y"]
+
+    # add defects
+    generator = np.random.default_rng(RANDOM_SEED)
+    for i in range(len(X)):
+        X[i] = add_defects(X[i], generator=generator, num_defects=args.defects)
+    
+    X = X.reshape(-1, 64 * 64)
+
+    np.savez_compressed(DATA_DIR / f"defect_data_{args.defects}.npz", X=X, y=y)
+    print(f"Cached data to {DATA_DIR / f'defect_data_{args.defects}.npz'}")
+
+    return 0
+
+def add_defects(arr: np.ndarray, generator: np.random.Generator, num_defects: int = 10) -> np.ndarray:
+    """Add defects to the array."""
+    radius = 2
+    xpos, ypos = np.meshgrid(np.arange(arr.shape[0]), np.arange(arr.shape[1]))
+    for _ in range(num_defects):
+        x = generator.integers(0, arr.shape[0])
+        y = generator.integers(0, arr.shape[1])
+        mask = (xpos - x)**2 + (ypos - y)**2 <= radius**2
+        arr[mask] = 0.0
+    return arr
+
 def train(args):
+    """Train a machine learning model on the dataset."""
+    if args.type == 'cnn':
+        train_cnn(args)
+    elif args.type == 'svc':
+        train_svc(args)
+    else:
+        print(f"Invalid model type: {args.type}")
+        return 1
+    return 0
+
+
+def train_cnn(args):
     """Train a machine learning model on the dataset."""
     
     # Set device
@@ -231,7 +326,7 @@ def train(args):
     # Training parameters
     num_epochs = 50
     best_val_loss = float('inf')
-    best_model_path = DATA_DIR / "best_model.pth"
+    best_model_path = MODELS_DIR / "cnn.pth"
     
     # Create logs directory and CSV log file
     LOGS_DIR.mkdir(exist_ok=True)
@@ -339,7 +434,77 @@ def train(args):
     return 0
 
 
+def train_svc(args):
+    """Train a clustering model on the dataset."""
 
+    # Load data
+    print("Loading dataset...")
+    data = np.load(DATA_DIR / "data.npz")
+    X = data["X"].reshape(-1, 64 * 64)  # shape: (n_samples, 64 * 64)
+    y = data["y"].squeeze()  # shape: (n_samples,)
+    print(f"Data shape: X={X.shape}, y={y.shape}")
+
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
+    
+    # Fit using support-vector machine classification with scikit
+    clf = SVC(C=1, kernel='linear')
+    clf.fit(X_train, y_train)
+    train_acc = clf.score(X_train, y_train)
+    val_acc = clf.score(X_test, y_test)
+
+    print(f"Train Acc: {train_acc:.2%} | "
+          f"Val Acc: {val_acc:.2%}")
+
+    # Save the model
+    joblib.dump(clf, MODELS_DIR / "svc.pkl")
+    print(f"Saved model to {MODELS_DIR / 'svc.pkl'}")
+
+    return 0
+
+def test(args):
+    """Test a machine learning model on the dataset."""
+    if args.type == 'cnn':
+        test_cnn(args)
+    elif args.type == 'svc':
+        test_svc(args)
+    else:
+        print(f"Invalid model type: {args.type}")
+        return 1
+    return 0
+
+def test_cnn(args):
+    """Test a CNN model on the dataset."""
+    model = MicrostructureCNN(num_classes=6)
+    model.load_state_dict(torch.load(MODELS_DIR / "cnn.pth"))
+    model.eval()
+
+    datafile = args.datafile
+    data = np.load(DATA_DIR / datafile)
+    X = data["X"].reshape(-1, 64, 64)
+    y = data["y"].squeeze()
+
+    with torch.no_grad():
+        outputs = model(X)
+    _, predicted = torch.max(outputs.data, 1)
+    test_acc = (predicted == y).sum().item() / len(y)
+    print(f"Acc: {test_acc:.2%}")
+    
+    return 0
+
+def test_svc(args):
+    """Test a SVC model on the dataset."""
+    model = joblib.load(MODELS_DIR / "svc.pkl")
+
+    datafile = args.datafile
+    data = np.load(DATA_DIR / datafile)
+    X = data["X"]
+    y = data["y"].squeeze()
+
+    predicted = model.predict(X)
+    test_acc = (predicted == y).sum().item() / len(y)
+    print(f"Acc: {test_acc:.2%}")
+
+    return 0
 
 def main():
     """Main entry point for the script."""

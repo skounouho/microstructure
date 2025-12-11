@@ -78,5 +78,5 @@ def get_xy_slice(data: np.ndarray, z_index: int) -> np.ndarray:
     if z_index < 0 or z_index >= nz:
         raise IndexError(f"z_index {z_index} out of bounds for data with {nz} Z slices")
     
-    return data[:101, :101, z_index]
+    return data[:64, :64, z_index]
 
